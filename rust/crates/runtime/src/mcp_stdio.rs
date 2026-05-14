@@ -1247,14 +1247,29 @@ impl McpStdioProcess {
     }
 
     pub async fn write_jsonrpc_message<T: Serialize>(&mut self, message: &T) -> io::Result<()> {
-        let body = serde_json::to_vec(message)
+        // MCP stdio transport per the spec is newline-delimited JSON-RPC:
+        // each message is one line of JSON terminated by '\n', no embedded
+        // newlines. The previous implementation used LSP-style Content-Length
+        // framing (`write_frame`) which MCP servers don't expect — mcp-go,
+        // the @modelcontextprotocol reference servers, and Claude Desktop's
+        // host all read line-delimited. With the old framing the server
+        // read "Content-Length: N" as its first "JSON line", failed to
+        // parse, never produced a response, and claw's initialize timed
+        // out after 10 s.
+        //
+        // ACX patch (not upstream). 2026-05-14.
+        let body = serde_json::to_string(message)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        self.write_frame(&body).await
+        self.write_line(&body).await
     }
 
     pub async fn read_jsonrpc_message<T: DeserializeOwned>(&mut self) -> io::Result<T> {
-        let payload = self.read_frame().await?;
-        serde_json::from_slice(&payload)
+        let line = self.read_line().await?;
+        // read_line returns the trailing '\n' (plus optional '\r' from
+        // CRLF emitters); trim before passing to serde to avoid spurious
+        // parse errors on some payloads.
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        serde_json::from_str(trimmed)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
     }
 
