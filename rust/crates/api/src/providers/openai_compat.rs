@@ -1,6 +1,7 @@
 use std::borrow::Cow;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
@@ -25,6 +26,36 @@ const ALT_REQUEST_ID_HEADER: &str = "x-request-id";
 const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(128);
 const DEFAULT_MAX_RETRIES: u32 = 8;
+
+/// Process-wide dedup set for the unregistered-reasoning-model warning. Keyed
+/// by raw model id (not canonicalized) so two callers passing different
+/// prefixes for the same model each get one warning. `Option<HashSet>` is the
+/// `const fn` workaround — `Mutex::new(None)` is const since Rust 1.63;
+/// `HashSet::new()` is not, so we lazy-init on first lock.
+static UNREGISTERED_REASONING_MODELS: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
+/// Emit a one-shot stderr warning when an unregistered model emits
+/// `reasoning_content` on the wire. Fires at most once per `(process, model)`.
+///
+/// This is a placeholder for the proper diagnostic channel claw-code will
+/// adopt later (tracing, telemetry, `ProviderDiagnostic`). Only the channel
+/// changes; the detection logic stays.
+fn warn_unregistered_reasoning_model_once(model: &str) {
+    if interleaved_reasoning_field_for_model(model).is_some() {
+        return;
+    }
+    let Ok(mut guard) = UNREGISTERED_REASONING_MODELS.lock() else {
+        return;
+    };
+    let seen = guard.get_or_insert_with(HashSet::new);
+    if seen.insert(model.to_string()) {
+        eprintln!(
+            "warning: model `{model}` emitted `reasoning_content` but is not in \
+             MODEL_INTERLEAVED_REASONING; subsequent multi-turn requests may fail \
+             with 400. Add a row to the table or wire this through config."
+        );
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpenAiCompatConfig {
@@ -506,16 +537,27 @@ impl StreamState {
 
         for choice in chunk.choices {
             // Handle reasoning/thinking from various provider fields
-            if let Some(reasoning) = choice
+            let reasoning_from_reasoning_content = choice
                 .delta
                 .reasoning_content
-                .filter(|value| !value.is_empty())
-                .or(choice
-                    .delta
-                    .thinking
-                    .and_then(|t| t.content)
-                    .filter(|value| !value.is_empty()))
-            {
+                .filter(|value| !value.is_empty());
+            let reasoning_from_thinking = choice
+                .delta
+                .thinking
+                .and_then(|t| t.content)
+                .filter(|value| !value.is_empty());
+
+            let reasoning = if let Some(value) = reasoning_from_reasoning_content {
+                // If the model isn't registered as interleaved-reasoning capable,
+                // warn once per process+model. This catches new models on the wire
+                // that we haven't added to MODEL_INTERLEAVED_REASONING yet.
+                warn_unregistered_reasoning_model_once(&self.model);
+                Some(value)
+            } else {
+                reasoning_from_thinking
+            };
+
+            if let Some(reasoning) = reasoning {
                 if !self.thinking_started {
                     self.thinking_started = true;
                     events.push(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
