@@ -36,6 +36,21 @@ pub enum ProviderKind {
     OpenAi,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InterleavedReasoningField {
+    ReasoningContent,
+}
+
+impl InterleavedReasoningField {
+    #[must_use]
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::ReasoningContent => "reasoning_content",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProviderMetadata {
     pub provider: ProviderKind,

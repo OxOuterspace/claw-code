@@ -15,7 +15,7 @@ use crate::types::{
     ToolChoice, ToolDefinition, ToolResultContentBlock, Usage,
 };
 
-use super::{preflight_message_request, Provider, ProviderFuture};
+use super::{preflight_message_request, InterleavedReasoningField, Provider, ProviderFuture};
 
 pub const DEFAULT_XAI_BASE_URL: &str = "https://api.x.ai/v1";
 pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
@@ -904,13 +904,34 @@ pub fn is_reasoning_model(model: &str) -> bool {
         || canonical.contains("thinking")
 }
 
-/// Returns true for OpenAI-compatible `DeepSeek` V4 models that require prior
-/// assistant reasoning to be echoed back as `reasoning_content` in history.
+/// Compile-time registry of models that require interleaved reasoning to be
+/// echoed back on assistant history messages, and the JSON field name each
+/// model uses for that echo. Add a row to extend; do not use prefix matching.
+const MODEL_INTERLEAVED_REASONING: &[(&str, InterleavedReasoningField)] = &[
+    ("deepseek-v4-pro",   InterleavedReasoningField::ReasoningContent),
+    ("deepseek-v4-flash", InterleavedReasoningField::ReasoningContent),
+];
+
+/// Returns the OpenAI-compatible field name a model uses for interleaved
+/// reasoning history, or `None` if the model does not require the echo.
 #[must_use]
-pub fn model_requires_reasoning_content_in_history(model: &str) -> bool {
+pub fn interleaved_reasoning_field_for_model(model: &str) -> Option<InterleavedReasoningField> {
     let lowered = model.to_ascii_lowercase();
     let canonical = lowered.rsplit('/').next().unwrap_or(lowered.as_str());
-    canonical.starts_with("deepseek-v4")
+    MODEL_INTERLEAVED_REASONING
+        .iter()
+        .find_map(|(name, field)| (*name == canonical).then_some(*field))
+}
+
+/// Returns true for OpenAI-compatible models that require prior assistant
+/// reasoning to be echoed back as `reasoning_content` in history.
+///
+/// Kept as a thin shim over [`interleaved_reasoning_field_for_model`] so
+/// upstream-merge churn against `ultraworkers/claw-code` doesn't conflict
+/// every time this symbol's body is touched there.
+#[must_use]
+pub fn model_requires_reasoning_content_in_history(model: &str) -> bool {
+    interleaved_reasoning_field_for_model(model).is_some()
 }
 
 /// Strip routing prefix (e.g., "openai/gpt-4" → "gpt-4") for the wire.
@@ -1686,11 +1707,13 @@ impl StringExt for String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_chat_completion_request, chat_completions_endpoint, is_reasoning_model,
+        build_chat_completion_request, chat_completions_endpoint,
+        interleaved_reasoning_field_for_model, is_reasoning_model,
         model_requires_reasoning_content_in_history, normalize_finish_reason, normalize_response,
         openai_tool_choice, parse_tool_arguments, OpenAiCompatClient, OpenAiCompatConfig,
         StreamState,
     };
+    use crate::providers::InterleavedReasoningField;
     use crate::error::ApiError;
     use crate::types::{
         ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent, ContentBlockStopEvent,
@@ -2729,5 +2752,78 @@ mod tests {
         assert_eq!(super::strip_routing_prefix("kimi/kimi-k2.5"), "kimi-k2.5");
         assert_eq!(super::strip_routing_prefix("kimi-k2.5"), "kimi-k2.5"); // no prefix, unchanged
         assert_eq!(super::strip_routing_prefix("kimi/kimi-k1.5"), "kimi-k1.5");
+    }
+
+    #[test]
+    fn interleaved_reasoning_field_for_model_returns_some_for_known_deepseek_v4_variants() {
+        let known = [
+            "deepseek-v4-flash",
+            "deepseek-v4-pro",
+            "openai/deepseek-v4-pro",
+            "deepseek/deepseek-v4-flash",
+            "DeepSeek-V4-Pro",
+        ];
+        for model in known {
+            assert_eq!(
+                interleaved_reasoning_field_for_model(model),
+                Some(InterleavedReasoningField::ReasoningContent),
+                "expected Some(ReasoningContent) for `{model}`",
+            );
+        }
+    }
+
+    #[test]
+    fn interleaved_reasoning_field_for_model_returns_none_for_unrelated_models() {
+        let unrelated = [
+            "deepseek-reasoner",
+            "deepseek-chat",
+            "deepseek-v3-flash",
+            "deepseek-v5-pro",
+            "gpt-4",
+            "claude-sonnet-4-6",
+            "grok-3",
+            "qwen-max",
+            "kimi-k2.5",
+        ];
+        for model in unrelated {
+            assert_eq!(
+                interleaved_reasoning_field_for_model(model),
+                None,
+                "expected None for `{model}`",
+            );
+        }
+    }
+
+    #[test]
+    fn shim_matches_new_lookup_for_full_corpus() {
+        let corpus = [
+            "deepseek-v4-flash",
+            "deepseek-v4-pro",
+            "openai/deepseek-v4-pro",
+            "deepseek/deepseek-v4-flash",
+            "DeepSeek-V4-Pro",
+            "deepseek-reasoner",
+            "deepseek-chat",
+            "deepseek-v3-flash",
+            "deepseek-v5-pro",
+            "gpt-4",
+            "claude-sonnet-4-6",
+            "grok-3",
+            "qwen-max",
+            "kimi-k2.5",
+        ];
+        for model in corpus {
+            assert_eq!(
+                model_requires_reasoning_content_in_history(model),
+                interleaved_reasoning_field_for_model(model).is_some(),
+                "shim/lookup disagree for `{model}`",
+            );
+        }
+    }
+
+    #[test]
+    fn interleaved_reasoning_field_wire_name_maps_to_reasoning_content() {
+        let field = InterleavedReasoningField::ReasoningContent;
+        assert_eq!(field.wire_name(), "reasoning_content");
     }
 }
