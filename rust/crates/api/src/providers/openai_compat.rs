@@ -1220,6 +1220,8 @@ pub fn translate_message(message: &InputMessage, model: &str) -> Vec<Value> {
                     // may be the empty string.
                     msg[field.wire_name()] = json!(reasoning);
                 }
+                // Only include tool_calls when non-empty: some providers reject
+                // assistant messages with an explicit empty tool_calls array.
                 if !tool_calls.is_empty() {
                     msg["tool_calls"] = json!(tool_calls);
                 }
@@ -1937,6 +1939,54 @@ mod tests {
         let messages = payload["messages"].as_array().expect("messages is an array");
         assert!(messages.is_empty(),
             "expected empty messages, got {} entries: {:?}", messages.len(), messages);
+    }
+
+    #[test]
+    fn interleaved_model_emits_reasoning_only_assistant_message() {
+        // Given an interleaved model (DeepSeek V4) and an assistant turn with
+        // ONLY a Thinking block — no text, no tool_calls. Mirrors
+        // `non_interleaved_model_drops_thinking_only_assistant_message` but
+        // pins the OPPOSITE behavior for interleaved models: the message is
+        // emitted with the reasoning carried under `reasoning_content`. This
+        // is the one branch of the `has_payload` gate where the refined
+        // `reasoning_counts_as_payload` formula uniquely differs from the
+        // spec's literal `!reasoning.is_empty()` form.
+        let request = MessageRequest {
+            model: "deepseek-v4-pro".to_string(),
+            max_tokens: 100,
+            messages: vec![InputMessage {
+                role: "assistant".to_string(),
+                content: vec![InputContentBlock::Thinking {
+                    thinking: "internal reasoning that the wire must carry".to_string(),
+                    signature: None,
+                }],
+            }],
+            stream: false,
+            ..Default::default()
+        };
+
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+
+        // Then exactly one assistant message is emitted with reasoning_content
+        // populated, content null/missing, and no tool_calls key.
+        let messages = payload["messages"].as_array().expect("messages is an array");
+        assert_eq!(messages.len(), 1, "expected exactly one message, got {messages:?}");
+        let assistant = &messages[0];
+        assert_eq!(assistant["role"], json!("assistant"));
+        assert_eq!(
+            assistant["reasoning_content"],
+            json!("internal reasoning that the wire must carry"),
+        );
+        let content = assistant.get("content");
+        assert!(
+            content.is_none() || content == Some(&json!(null)),
+            "expected null/missing content, got {content:?}",
+        );
+        assert!(
+            assistant.get("tool_calls").is_none(),
+            "expected no tool_calls key, got {:?}",
+            assistant.get("tool_calls"),
+        );
     }
 
     #[test]
