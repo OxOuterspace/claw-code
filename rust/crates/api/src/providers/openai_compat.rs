@@ -1194,13 +1194,18 @@ pub fn translate_message(message: &InputMessage, model: &str) -> Vec<Value> {
                     InputContentBlock::ToolResult { .. } => {}
                 }
             }
-            // A completely empty assistant turn (no text, no tool_calls, no reasoning)
-            // is still dropped, even for interleaved models — an OpenAI-compat server
-            // would reject {role: "assistant", content: null, reasoning_content: ""}
-            // with no tool_calls as "neither content nor tool_calls present". The
-            // interleaved emit-empty fix only applies when there's something *else*
-            // on the message.
-            let has_payload = !text.is_empty() || !tool_calls.is_empty() || !reasoning.is_empty();
+            // Decide whether this assistant turn carries enough to emit.
+            // - Text and tool_calls always count as payload.
+            // - Reasoning counts as payload ONLY if the model declares an interleaved
+            //   reasoning field. For non-interleaved models the reasoning is dropped
+            //   at the wire anyway, so a reasoning-only message would emit
+            //   {role: "assistant", content: null} and most OpenAI-compat servers 400
+            //   on that. Match the pre-Task-3 drop semantics for that case.
+            // - A fully empty turn (no text, no tool_calls, no payload-counting
+            //   reasoning) is dropped even for interleaved models — emitting an empty
+            //   reasoning_content with content: null and no tool_calls would also 400.
+            let reasoning_counts_as_payload = interleaved_field.is_some() && !reasoning.is_empty();
+            let has_payload = !text.is_empty() || !tool_calls.is_empty() || reasoning_counts_as_payload;
             if !has_payload {
                 Vec::new()
             } else {
@@ -1902,6 +1907,36 @@ mod tests {
             messages.len(),
             messages
         );
+    }
+
+    #[test]
+    fn non_interleaved_model_drops_thinking_only_assistant_message() {
+        // Given a non-interleaved model (e.g., claude) and an assistant turn
+        // with ONLY a Thinking block — no text, no tool_calls.
+        let request = MessageRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            max_tokens: 100,
+            messages: vec![InputMessage {
+                role: "assistant".to_string(),
+                content: vec![InputContentBlock::Thinking {
+                    thinking: "internal reasoning that should not reach the wire"
+                        .to_string(),
+                    signature: None,
+                }],
+            }],
+            stream: false,
+            ..Default::default()
+        };
+
+        // When serializing for an OpenAI-compat backend.
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+
+        // Then the assistant message is dropped — non-interleaved models do not
+        // carry reasoning on the wire, so a reasoning-only payload-less turn
+        // would become {content: null} which most servers reject with 400.
+        let messages = payload["messages"].as_array().expect("messages is an array");
+        assert!(messages.is_empty(),
+            "expected empty messages, got {} entries: {:?}", messages.len(), messages);
     }
 
     #[test]
