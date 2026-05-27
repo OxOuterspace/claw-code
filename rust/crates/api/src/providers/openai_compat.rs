@@ -950,8 +950,14 @@ pub fn is_reasoning_model(model: &str) -> bool {
 /// echoed back on assistant history messages, and the JSON field name each
 /// model uses for that echo. Add a row to extend; do not use prefix matching.
 const MODEL_INTERLEAVED_REASONING: &[(&str, InterleavedReasoningField)] = &[
-    ("deepseek-v4-pro",   InterleavedReasoningField::ReasoningContent),
-    ("deepseek-v4-flash", InterleavedReasoningField::ReasoningContent),
+    (
+        "deepseek-v4-pro",
+        InterleavedReasoningField::ReasoningContent,
+    ),
+    (
+        "deepseek-v4-flash",
+        InterleavedReasoningField::ReasoningContent,
+    ),
 ];
 
 /// Returns the OpenAI-compatible field name a model uses for interleaved
@@ -1247,7 +1253,8 @@ pub fn translate_message(message: &InputMessage, model: &str) -> Vec<Value> {
             //   reasoning) is dropped even for interleaved models — emitting an empty
             //   reasoning_content with content: null and no tool_calls would also 400.
             let reasoning_counts_as_payload = interleaved_field.is_some() && !reasoning.is_empty();
-            let has_payload = !text.is_empty() || !tool_calls.is_empty() || reasoning_counts_as_payload;
+            let has_payload =
+                !text.is_empty() || !tool_calls.is_empty() || reasoning_counts_as_payload;
             if !has_payload {
                 Vec::new()
             } else {
@@ -1770,8 +1777,8 @@ mod tests {
         openai_tool_choice, parse_tool_arguments, OpenAiCompatClient, OpenAiCompatConfig,
         StreamState,
     };
-    use crate::providers::InterleavedReasoningField;
     use crate::error::ApiError;
+    use crate::providers::InterleavedReasoningField;
     use crate::types::{
         ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent, ContentBlockStopEvent,
         InputContentBlock, InputMessage, MessageRequest, OutputContentBlock, StreamEvent,
@@ -1944,7 +1951,9 @@ mod tests {
         // interleaved reasoning, we MUST NOT emit a payload-less
         // {content: null, reasoning_content: ""} message. Most OpenAI-compat
         // servers reject it.
-        let messages = payload["messages"].as_array().expect("messages is an array");
+        let messages = payload["messages"]
+            .as_array()
+            .expect("messages is an array");
         assert!(
             messages.is_empty(),
             "expected empty messages, got {} entries: {:?}",
@@ -1963,8 +1972,7 @@ mod tests {
             messages: vec![InputMessage {
                 role: "assistant".to_string(),
                 content: vec![InputContentBlock::Thinking {
-                    thinking: "internal reasoning that should not reach the wire"
-                        .to_string(),
+                    thinking: "internal reasoning that should not reach the wire".to_string(),
                     signature: None,
                 }],
             }],
@@ -1978,9 +1986,15 @@ mod tests {
         // Then the assistant message is dropped — non-interleaved models do not
         // carry reasoning on the wire, so a reasoning-only payload-less turn
         // would become {content: null} which most servers reject with 400.
-        let messages = payload["messages"].as_array().expect("messages is an array");
-        assert!(messages.is_empty(),
-            "expected empty messages, got {} entries: {:?}", messages.len(), messages);
+        let messages = payload["messages"]
+            .as_array()
+            .expect("messages is an array");
+        assert!(
+            messages.is_empty(),
+            "expected empty messages, got {} entries: {:?}",
+            messages.len(),
+            messages
+        );
     }
 
     #[test]
@@ -2011,8 +2025,14 @@ mod tests {
 
         // Then exactly one assistant message is emitted with reasoning_content
         // populated, content null/missing, and no tool_calls key.
-        let messages = payload["messages"].as_array().expect("messages is an array");
-        assert_eq!(messages.len(), 1, "expected exactly one message, got {messages:?}");
+        let messages = payload["messages"]
+            .as_array()
+            .expect("messages is an array");
+        assert_eq!(
+            messages.len(),
+            1,
+            "expected exactly one message, got {messages:?}"
+        );
         let assistant = &messages[0];
         assert_eq!(assistant["role"], json!("assistant"));
         assert_eq!(
