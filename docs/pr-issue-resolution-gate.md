@@ -18,14 +18,39 @@ Before the Claw Code 2.0 Ultragoal can be marked complete:
 
 ## Current live snapshot
 
-A live snapshot was captured locally during G002 execution:
+A fresh non-destructive snapshot was captured locally during G011 W3 execution:
 
-- PR snapshot: `.omx/research/github-live/open-prs.json`
-- Issue snapshot: `.omx/research/github-live/open-issues.json`
-- Captured on: 2026-05-14 during the active Ultragoal run.
-- Observed counts: 50 open PR records and 1000 open issue records from GitHub CLI list calls.
+- Command: `gh pr list --state open --limit 1000 --json number,title,state,updatedAt,url`
+- Command: `gh issue list --state open --limit 1000 --json number,title,state,updatedAt,url,labels`
+- Captured on: 2026-05-15T02:39:41Z during the active Ultragoal run.
+- Observed counts: 51 open PR records and 1000 open issue records from GitHub CLI list calls.
+- Most recent open PR in the snapshot: #3040, `fix: recognize OPENAI_API_KEY as valid auth for OpenAI-compatible endpoints`, updated 2026-05-14T11:35:23Z.
+- Most recent open issue in the snapshot: #3039, `How to install skills?`, updated 2026-05-14T08:14:36Z.
+- The issue snapshot hit the configured `--limit 1000`, so the final gate must treat the issue count as at least 1000 unless a higher-limit export or paginated ledger is captured.
 
-These local `.omx/research/github-live/*` files are evidence inputs, not final proof. The final gate must refresh them and compare deltas.
+These command outputs are evidence inputs, not final proof. The final gate must refresh them and compare deltas before any completion claim.
+
+## Anti-slop triage templates
+
+Use `docs/anti-slop-triage.md` plus the repository templates before acting on the live snapshot:
+
+- `.github/ISSUE_TEMPLATE/anti_slop_triage.yml` records the initial issue classification, evidence, and non-destructive next action.
+- `.github/PULL_REQUEST_TEMPLATE.md` adds PR classification, verification, and resolution-gate checklist items.
+
+The anti-slop classifications are: `actionable-bug`, `actionable-docs`, `actionable-feature`, `duplicate`, `spam-or-promotion`, `generated-slop-or-hallucinated`, `unsafe-or-security-sensitive`, `not-reproducible-yet`, and `externally-blocked`.
+
+Automation lanes may recommend labels, comments, defer/close rationales, or merge candidates, but must not merge or close remote PRs/issues without maintainer-owned approval.
+
+
+## G012 final PR reconciliation snapshot
+
+Worker-3 captured a fresh PR ledger for the final Claw Code 2.0 gate in `docs/pr-triage-g012-final-gate.json`.
+
+- Captured on: 2026-05-15T02:58:00Z during G012 final-gate execution.
+- Commands: `gh pr list --state open --limit 100 ...` plus `gh pr view <number> ...` for per-PR file and merge-state evidence.
+- Observed count: 51 open PR records.
+- Merge action taken by worker-3: none. The safety policy requires correct, safe, non-conflicting, resolvable PRs with evidence; this snapshot found 32 PRs in `CONFLICTING`/`DIRTY` state and 19 `MERGEABLE` PRs that GitHub reported as `UNSTABLE` with no fresh check-rollup evidence in the live snapshot.
+- Docs-only candidate-review PRs: #3021 and #2824 remain deferred until content/source-of-truth review and fresh verification are available.
 
 ## Required final evidence
 
