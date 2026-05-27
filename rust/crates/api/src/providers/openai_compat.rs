@@ -1173,6 +1173,7 @@ pub fn translate_message(message: &InputMessage, model: &str) -> Vec<Value> {
     let supports_is_error = !model_rejects_is_error_field(model);
     match message.role.as_str() {
         "assistant" => {
+            let interleaved_field = interleaved_reasoning_field_for_model(model);
             let mut text = String::new();
             let mut reasoning = String::new();
             let mut tool_calls = Vec::new();
@@ -1193,20 +1194,27 @@ pub fn translate_message(message: &InputMessage, model: &str) -> Vec<Value> {
                     InputContentBlock::ToolResult { .. } => {}
                 }
             }
-            let include_reasoning =
-                model_requires_reasoning_content_in_history(model) && !reasoning.is_empty();
-            if text.is_empty() && tool_calls.is_empty() && !include_reasoning {
+            // A completely empty assistant turn (no text, no tool_calls, no reasoning)
+            // is still dropped, even for interleaved models — an OpenAI-compat server
+            // would reject {role: "assistant", content: null, reasoning_content: ""}
+            // with no tool_calls as "neither content nor tool_calls present". The
+            // interleaved emit-empty fix only applies when there's something *else*
+            // on the message.
+            let has_payload = !text.is_empty() || !tool_calls.is_empty() || !reasoning.is_empty();
+            if !has_payload {
                 Vec::new()
             } else {
                 let mut msg = serde_json::json!({
                     "role": "assistant",
                     "content": (!text.is_empty()).then_some(text),
                 });
-                if include_reasoning {
-                    msg["reasoning_content"] = json!(reasoning);
+                if let Some(field) = interleaved_field {
+                    // Always emit the field for interleaved models, even when the
+                    // reasoning text is empty. DeepSeek's wire contract requires the
+                    // KEY to be present on every assistant history message; the value
+                    // may be the empty string.
+                    msg[field.wire_name()] = json!(reasoning);
                 }
-                // Only include tool_calls when non-empty: some providers reject
-                // assistant messages with an explicit empty tool_calls array.
                 if !tool_calls.is_empty() {
                     msg["tool_calls"] = json!(tool_calls);
                 }
@@ -1833,6 +1841,70 @@ mod tests {
     }
 
     #[test]
+    fn deepseek_v4_text_only_assistant_includes_empty_reasoning_content() {
+        // Given a DeepSeek V4 model + assistant turn with text only (no Thinking).
+        let request = assistant_text_only_request("deepseek-v4-pro");
+
+        // When serializing.
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+
+        // Then the assistant message carries `reasoning_content: ""` (key present,
+        // empty string) — DeepSeek requires the key on every assistant history
+        // message, and empty string is the correct echo value when no prior
+        // Thinking accumulated.
+        let assistant = &payload["messages"][0];
+        assert_eq!(assistant["role"], json!("assistant"));
+        assert_eq!(assistant["content"], json!("Here is my answer."));
+        assert_eq!(assistant["reasoning_content"], json!(""));
+    }
+
+    #[test]
+    fn deepseek_v4_tool_call_only_assistant_includes_empty_reasoning_content() {
+        // Given a DeepSeek V4 model + assistant turn with a tool call only.
+        let request = assistant_tool_call_only_request("deepseek-v4-flash");
+
+        // When serializing.
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+
+        // Then `reasoning_content: ""` is present alongside tool_calls.
+        let assistant = &payload["messages"][0];
+        assert_eq!(assistant["role"], json!("assistant"));
+        assert_eq!(assistant["reasoning_content"], json!(""));
+        assert!(
+            assistant.get("tool_calls").is_some(),
+            "expected tool_calls on the serialized assistant message"
+        );
+        // `content` is either null or omitted — both are acceptable for a
+        // tool-call-only message.
+        let content = assistant.get("content");
+        assert!(
+            content.is_none() || content == Some(&json!(null)),
+            "expected null/missing content, got {content:?}"
+        );
+    }
+
+    #[test]
+    fn deepseek_v4_fully_empty_assistant_is_still_dropped() {
+        // Given a DeepSeek V4 model + a payload-less assistant turn.
+        let request = assistant_empty_request("deepseek-v4-pro");
+
+        // When serializing.
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+
+        // Then the messages array is empty — even though the model declares
+        // interleaved reasoning, we MUST NOT emit a payload-less
+        // {content: null, reasoning_content: ""} message. Most OpenAI-compat
+        // servers reject it.
+        let messages = payload["messages"].as_array().expect("messages is an array");
+        assert!(
+            messages.is_empty(),
+            "expected empty messages, got {} entries: {:?}",
+            messages.len(),
+            messages
+        );
+    }
+
+    #[test]
     fn non_streaming_response_with_reasoning_content_emits_thinking_block_first() {
         // Given a non-streaming OpenAI-compatible response with reasoning_content.
         let response = super::ChatCompletionResponse {
@@ -2123,6 +2195,51 @@ mod tests {
                         text: "answer".to_string(),
                     },
                 ],
+            }],
+            stream: false,
+            ..Default::default()
+        }
+    }
+
+    fn assistant_text_only_request(model: &str) -> MessageRequest {
+        MessageRequest {
+            model: model.to_string(),
+            max_tokens: 100,
+            messages: vec![InputMessage {
+                role: "assistant".to_string(),
+                content: vec![InputContentBlock::Text {
+                    text: "Here is my answer.".to_string(),
+                }],
+            }],
+            stream: false,
+            ..Default::default()
+        }
+    }
+
+    fn assistant_tool_call_only_request(model: &str) -> MessageRequest {
+        MessageRequest {
+            model: model.to_string(),
+            max_tokens: 100,
+            messages: vec![InputMessage {
+                role: "assistant".to_string(),
+                content: vec![InputContentBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    name: "read_file".to_string(),
+                    input: json!({"path": "/tmp/foo"}),
+                }],
+            }],
+            stream: false,
+            ..Default::default()
+        }
+    }
+
+    fn assistant_empty_request(model: &str) -> MessageRequest {
+        MessageRequest {
+            model: model.to_string(),
+            max_tokens: 100,
+            messages: vec![InputMessage {
+                role: "assistant".to_string(),
+                content: vec![],
             }],
             stream: false,
             ..Default::default()
