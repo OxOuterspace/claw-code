@@ -94,6 +94,7 @@ pub struct ProviderCapabilityReport {
     pub custom_parameters: ProviderFeatureSupport,
     pub reasoning_effort: ProviderFeatureSupport,
     pub reasoning_content_history: ProviderFeatureSupport,
+    pub interleaved_reasoning_field: Option<InterleavedReasoningField>,
     pub fixed_sampling_reasoning_models: ProviderFeatureSupport,
     pub web_search: ProviderFeatureSupport,
     pub web_fetch: ProviderFeatureSupport,
@@ -445,6 +446,8 @@ pub fn provider_capabilities_for_model(model: &str) -> ProviderCapabilityReport 
         ),
     };
 
+    let interleaved_reasoning_field = openai_compat::interleaved_reasoning_field_for_model(model);
+
     ProviderCapabilityReport {
         provider: metadata.provider,
         wire_protocol,
@@ -458,6 +461,7 @@ pub fn provider_capabilities_for_model(model: &str) -> ProviderCapabilityReport 
         custom_parameters,
         reasoning_effort,
         reasoning_content_history,
+        interleaved_reasoning_field,
         fixed_sampling_reasoning_models,
         web_search: ProviderFeatureSupport::PassthroughAsTool,
         web_fetch: ProviderFeatureSupport::PassthroughAsTool,
@@ -840,8 +844,8 @@ mod tests {
         load_dotenv_file, max_tokens_for_model, max_tokens_for_model_with_override,
         model_family_identity_for, model_family_identity_for_kind, model_token_limit, parse_dotenv,
         preflight_message_request, provider_capabilities_for_model,
-        provider_diagnostics_for_request, resolve_model_alias, ProviderFeatureSupport,
-        ProviderKind, ProviderWireProtocol,
+        provider_diagnostics_for_request, resolve_model_alias, InterleavedReasoningField,
+        ProviderFeatureSupport, ProviderKind, ProviderWireProtocol,
     };
 
     /// Serializes every test in this module that mutates process-wide
@@ -971,6 +975,39 @@ mod tests {
         assert_eq!(anthropic.prompt_cache, ProviderFeatureSupport::Supported);
         assert_eq!(
             anthropic.custom_parameters,
+            ProviderFeatureSupport::Unsupported
+        );
+    }
+
+    #[test]
+    fn provider_capabilities_for_model_reports_interleaved_field_for_deepseek_v4() {
+        let report = provider_capabilities_for_model("openai/deepseek-v4-pro");
+        assert_eq!(
+            report.interleaved_reasoning_field,
+            Some(InterleavedReasoningField::ReasoningContent),
+        );
+        assert_eq!(
+            report.reasoning_content_history,
+            ProviderFeatureSupport::Supported
+        );
+    }
+
+    #[test]
+    fn provider_capabilities_for_model_reports_no_interleaved_field_for_anthropic() {
+        let report = provider_capabilities_for_model("claude-sonnet-4-6");
+        assert_eq!(report.interleaved_reasoning_field, None);
+        assert_eq!(
+            report.reasoning_content_history,
+            ProviderFeatureSupport::Unsupported
+        );
+    }
+
+    #[test]
+    fn provider_capabilities_for_model_reports_no_interleaved_field_for_non_v4_openai() {
+        let report = provider_capabilities_for_model("openai/gpt-4.1-mini");
+        assert_eq!(report.interleaved_reasoning_field, None);
+        assert_eq!(
+            report.reasoning_content_history,
             ProviderFeatureSupport::Unsupported
         );
     }
