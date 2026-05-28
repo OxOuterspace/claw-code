@@ -349,7 +349,7 @@ pub fn provider_diagnostics_for_model(model: &str) -> ProviderDiagnostics {
             && metadata.default_base_url == openai_compat::DEFAULT_OPENAI_BASE_URL,
         honors_proxy_env: true,
         supports_extra_body_params: openai_compatible,
-        preserves_slash_model_ids_on_custom_base_url: metadata.provider == ProviderKind::OpenAi,
+        preserves_slash_model_ids_on_custom_base_url: false,
     }
 }
 
@@ -1162,7 +1162,7 @@ mod tests {
         assert!(diagnostics.preserves_reasoning_content_in_history);
         assert!(diagnostics.supports_extra_body_params);
         assert!(diagnostics.honors_proxy_env);
-        assert!(diagnostics.preserves_slash_model_ids_on_custom_base_url);
+        assert!(!diagnostics.preserves_slash_model_ids_on_custom_base_url);
     }
 
     #[test]

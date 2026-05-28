@@ -1003,8 +1003,8 @@ fn strip_routing_prefix(model: &str) -> &str {
 
 fn wire_model_for_base_url<'a>(
     model: &'a str,
-    config: OpenAiCompatConfig,
-    base_url: &str,
+    _config: OpenAiCompatConfig,
+    _base_url: &str,
 ) -> Cow<'a, str> {
     let Some(pos) = model.find('/') else {
         return Cow::Borrowed(model);
@@ -1012,25 +1012,12 @@ fn wire_model_for_base_url<'a>(
     let prefix = &model[..pos];
     let lowered_prefix = prefix.to_ascii_lowercase();
 
-    if lowered_prefix == "openai" {
-        let trimmed_base_url = base_url.trim_end_matches('/');
-        let default_openai = DEFAULT_OPENAI_BASE_URL.trim_end_matches('/');
-        if matches!(
-            lowered_prefix.as_str(),
-            "xai" | "grok" | "kimi" | "gemini" | "gemma"
-        ) {
-            return Cow::Borrowed(&model[pos + 1..]);
-        }
-        if config.provider_name == "OpenAI" && trimmed_base_url != default_openai {
-            // Only preserve the full slug if it's NOT a model we want to strip
-            if !model.contains("gemini") && !model.contains("gemma") {
-                return Cow::Borrowed(model);
-            }
-        }
-        return Cow::Borrowed(&model[pos + 1..]);
-    }
-
-    if matches!(lowered_prefix.as_str(), "xai" | "grok" | "qwen" | "kimi") {
+    // Routing prefixes are claw-code's internal convention — always strip
+    // them before sending to the wire so the backend sees the bare model id.
+    if matches!(
+        lowered_prefix.as_str(),
+        "openai" | "xai" | "grok" | "qwen" | "kimi"
+    ) {
         return Cow::Borrowed(&model[pos + 1..]);
     }
 
