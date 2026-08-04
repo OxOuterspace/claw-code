@@ -162,7 +162,10 @@ async fn send_message_preserves_deepseek_reasoning_content_before_text() {
 }
 
 #[tokio::test]
-async fn custom_openai_gateway_preserves_slash_model_ids_and_extra_body_params() {
+async fn custom_openai_gateway_strips_routing_prefix_and_preserves_extra_body_params() {
+    // Since e0813a5 the openai/ routing prefix NEVER reaches the wire —
+    // it exists only to select transport. This test previously asserted the
+    // old preserve behavior and was left stale by that commit.
     let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
     let body = concat!(
         "{",
@@ -206,7 +209,7 @@ async fn custom_openai_gateway_preserves_slash_model_ids_and_extra_body_params()
     let captured = state.lock().await;
     let request = captured.first().expect("captured request");
     let body: serde_json::Value = serde_json::from_str(&request.body).expect("json body");
-    assert_eq!(body["model"], json!("openai/gpt-4.1-mini"));
+    assert_eq!(body["model"], json!("gpt-4.1-mini")); // routing prefix stripped for the wire
     assert_eq!(
         body["web_search_options"],
         json!({"search_context_size": "low"})

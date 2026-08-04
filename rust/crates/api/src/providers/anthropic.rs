@@ -470,6 +470,7 @@ impl AnthropicClient {
         let request_url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
         let mut request_body = self.request_profile.render_json_body(request)?;
         strip_unsupported_beta_body_fields(&mut request_body);
+        strip_model_routing_prefix(&mut request_body);
         let request_builder = self.build_request(&request_url).json(&request_body);
         request_builder.send().await.map_err(ApiError::from)
     }
@@ -531,6 +532,7 @@ impl AnthropicClient {
         );
         let mut request_body = self.request_profile.render_json_body(request)?;
         strip_unsupported_beta_body_fields(&mut request_body);
+        strip_model_routing_prefix(&mut request_body);
         let response = self
             .build_request(&request_url)
             .json(&request_body)
@@ -991,6 +993,23 @@ fn strip_unsupported_beta_body_fields(body: &mut Value) {
         if let Some(stop_val) = object.remove("stop") {
             if stop_val.as_array().is_some_and(|a| !a.is_empty()) {
                 object.insert("stop_sequences".to_string(), stop_val);
+            }
+        }
+    }
+}
+
+/// The "anthropic/" prefix is claw-code's internal routing convention — it
+/// selects this transport and must never reach the wire: the Anthropic API
+/// knows only bare model ids and 404s on "anthropic/claude-…". Mirrors
+/// `openai_compat::strip_routing_prefix`, whose known-prefix list never
+/// covered this provider's own family (the historic gap: every qualified
+/// anthropic model name 404'd, forcing alias-only configs downstream).
+fn strip_model_routing_prefix(body: &mut Value) {
+    if let Some(model) = body.get("model").and_then(Value::as_str) {
+        if let Some(bare) = model.strip_prefix("anthropic/") {
+            let bare = bare.to_string();
+            if let Some(object) = body.as_object_mut() {
+                object.insert("model".to_string(), Value::String(bare));
             }
         }
     }
@@ -1468,6 +1487,40 @@ mod tests {
         super::strip_unsupported_beta_body_fields(&mut body);
 
         assert_eq!(body, original);
+    }
+
+    #[test]
+    fn strip_model_routing_prefix_strips_anthropic_prefix_for_the_wire() {
+        // "anthropic/claude-…" is claw's internal routing syntax; the API
+        // knows only bare ids and 404s on the qualified form. Both wire
+        // sites (/v1/messages and /v1/messages/count_tokens) run this strip.
+        let mut body = serde_json::json!({
+            "model": "anthropic/claude-opus-4-7",
+            "max_tokens": 1024,
+        });
+
+        super::strip_model_routing_prefix(&mut body);
+
+        assert_eq!(
+            body.get("model").and_then(serde_json::Value::as_str),
+            Some("claude-opus-4-7")
+        );
+        assert_eq!(body["max_tokens"], serde_json::json!(1024));
+    }
+
+    #[test]
+    fn strip_model_routing_prefix_is_a_noop_on_bare_and_foreign_prefixes() {
+        let mut bare = serde_json::json!({ "model": "claude-sonnet-4-6" });
+        let bare_original = bare.clone();
+        super::strip_model_routing_prefix(&mut bare);
+        assert_eq!(bare, bare_original);
+
+        // A foreign routing prefix is not ours to touch — wrong transport
+        // if it ever got here, and openai_compat owns that strip list.
+        let mut foreign = serde_json::json!({ "model": "openai/gpt-5" });
+        let foreign_original = foreign.clone();
+        super::strip_model_routing_prefix(&mut foreign);
+        assert_eq!(foreign, foreign_original);
     }
 
     #[test]
