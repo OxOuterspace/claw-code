@@ -958,6 +958,17 @@ const MODEL_INTERLEAVED_REASONING: &[(&str, InterleavedReasoningField)] = &[
         "deepseek-v4-flash",
         InterleavedReasoningField::ReasoningContent,
     ),
+    // xAI grok-4.5: confirmed via `warn_unregistered_reasoning_model_once` firing
+    // in production (ACX Core Capital instance, 2026-08-19) — the model streams
+    // `reasoning_content` deltas on the wire like the DeepSeek V4 pair above, but
+    // wasn't registered here yet. Left unregistered, `translate_message` (below)
+    // drops a reasoning-only assistant turn entirely (no text/tool_calls payload,
+    // and `reasoning_counts_as_payload` requires `interleaved_field.is_some()`),
+    // which erases that turn from history sent back to the model — observed as a
+    // silent ~48s stall (model "loses" its own preceding thinking) before the
+    // harness's turn timeout fires, never reaching the tool call it was building
+    // up to.
+    ("grok-4.5", InterleavedReasoningField::ReasoningContent),
 ];
 
 /// Returns the OpenAI-compatible field name a model uses for interleaved
