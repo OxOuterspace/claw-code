@@ -18,6 +18,10 @@ use crate::usage::{TokenUsage, UsageTracker};
 const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 100_000;
 const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS";
 
+/// The error a provider stream with no content block produces. The turn loop
+/// re-issues the request once on exactly this error.
+const EMPTY_ASSISTANT_STREAM: &str = "assistant stream produced no content";
+
 /// Fully assembled request payload sent to the upstream model client.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiRequest {
@@ -315,6 +319,20 @@ where
     }
 
     #[allow(clippy::too_many_lines)]
+    fn stream_assistant_message(
+        &mut self,
+        request: ApiRequest,
+    ) -> Result<
+        (
+            ConversationMessage,
+            Option<TokenUsage>,
+            Vec<PromptCacheEvent>,
+        ),
+        RuntimeError,
+    > {
+        build_assistant_message(self.api_client.stream(request)?)
+    }
+
     pub fn run_turn(
         &mut self,
         user_input: impl Into<String>,
@@ -358,21 +376,20 @@ where
                 system_prompt: self.system_prompt.clone(),
                 messages: self.session.messages.clone(),
             };
-            let events = match self.api_client.stream(request) {
-                Ok(events) => events,
+            // A provider stream can end with no content block at all (seen
+            // with grok-4-fast right after a tool result); the same request
+            // re-sent succeeds. Re-issue it once before failing the turn.
+            let mut built = self.stream_assistant_message(request.clone());
+            if matches!(&built, Err(error) if error.to_string() == EMPTY_ASSISTANT_STREAM) {
+                built = self.stream_assistant_message(request);
+            }
+            let (assistant_message, usage, turn_prompt_cache_events) = match built {
+                Ok(result) => result,
                 Err(error) => {
                     self.record_turn_failed(iterations, &error);
                     return Err(error);
                 }
             };
-            let (assistant_message, usage, turn_prompt_cache_events) =
-                match build_assistant_message(events) {
-                    Ok(result) => result,
-                    Err(error) => {
-                        self.record_turn_failed(iterations, &error);
-                        return Err(error);
-                    }
-                };
             if let Some(usage) = usage {
                 self.usage_tracker.record(usage);
             }
@@ -761,7 +778,7 @@ fn build_assistant_message(
         ));
     }
     if blocks.is_empty() {
-        return Err(RuntimeError::new("assistant stream produced no content"));
+        return Err(RuntimeError::new(EMPTY_ASSISTANT_STREAM));
     }
 
     Ok((
@@ -1015,6 +1032,83 @@ mod tests {
         assert!(trace_names.contains(&"tool_execution_started"));
         assert!(trace_names.contains(&"tool_execution_finished"));
         assert!(trace_names.contains(&"turn_completed"));
+    }
+
+    /// Replays a fixed script of streams, recording each request it saw.
+    struct EmptyThenReplyClient {
+        streams: Vec<Vec<AssistantEvent>>,
+        requests: Vec<ApiRequest>,
+    }
+
+    impl ApiClient for EmptyThenReplyClient {
+        fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            self.requests.push(request);
+            assert!(
+                !self.streams.is_empty(),
+                "more requests than scripted streams"
+            );
+            Ok(self.streams.remove(0))
+        }
+    }
+
+    fn empty_stream() -> Vec<AssistantEvent> {
+        vec![AssistantEvent::MessageStop]
+    }
+
+    #[test]
+    fn empty_assistant_stream_is_retried_once_with_the_same_request() {
+        let client = EmptyThenReplyClient {
+            streams: vec![
+                empty_stream(),
+                vec![
+                    AssistantEvent::TextDelta("the answer".to_string()),
+                    AssistantEvent::MessageStop,
+                ],
+            ],
+            requests: Vec::new(),
+        };
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            client,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        );
+
+        let summary = runtime
+            .run_turn("question", None)
+            .expect("the resend recovers the turn");
+
+        assert_eq!(summary.assistant_messages.len(), 1);
+        assert!(matches!(
+            &summary.assistant_messages[0].blocks[0],
+            ContentBlock::Text { text } if text == "the answer"
+        ));
+        let requests = &runtime.api_client.requests;
+        assert_eq!(requests.len(), 2, "exactly one resend");
+        assert_eq!(requests[0], requests[1], "the resend is the same request");
+    }
+
+    #[test]
+    fn empty_assistant_stream_twice_fails_the_turn_after_one_resend() {
+        let client = EmptyThenReplyClient {
+            streams: vec![empty_stream(), empty_stream()],
+            requests: Vec::new(),
+        };
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            client,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        );
+
+        let error = runtime
+            .run_turn("question", None)
+            .expect_err("a second empty stream surfaces the error");
+
+        assert_eq!(error.to_string(), super::EMPTY_ASSISTANT_STREAM);
+        assert_eq!(runtime.api_client.requests.len(), 2);
     }
 
     #[test]
