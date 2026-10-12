@@ -191,6 +191,8 @@ const CLI_OPTION_SUGGESTIONS: &[&str] = &[
     "--dangerously-skip-permissions",
     "--allowedTools",
     "--allowed-tools",
+    "--disallowedTools",
+    "--disallowed-tools",
     "--resume",
     "--acp",
     "-acp",
@@ -529,6 +531,12 @@ fn plugin_load_failure_json(failure: &plugins::PluginLoadFailure) -> Value {
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
+    // `--disallowedTools` is process-wide: install it before parse_args or
+    // any registry is built, so every listing and executor sees it.
+    let disallowed = disallowed_tool_values(&args);
+    if !disallowed.is_empty() {
+        tools::set_disallowed_tools(tools::normalize_disallowed_tools(&disallowed));
+    }
     match parse_args(&args)? {
         CliAction::DumpManifests {
             output_format,
@@ -1018,6 +1026,19 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             }
             flag if flag.starts_with("--allowed-tools=") => {
                 allowed_tool_values.push(flag[16..].to_string());
+                index += 1;
+            }
+            "--disallowedTools" | "--disallowed-tools" => {
+                // Collected by `disallowed_tool_values` in run(); validated
+                // here only for its value.
+                args
+                    .get(index + 1)
+                    .ok_or_else(|| "missing_flag_value: missing value for --disallowedTools.\nUsage: --disallowedTools <tool-name>  e.g. --disallowedTools MCP,REPL".to_string())?;
+                index += 2;
+            }
+            flag if flag.starts_with("--disallowedTools=")
+                || flag.starts_with("--disallowed-tools=") =>
+            {
                 index += 1;
             }
             other if rest.is_empty() && other.starts_with('-') => {
@@ -1975,6 +1996,31 @@ fn config_alias_for_current_dir(alias: &str) -> Option<String> {
     let loader = ConfigLoader::default_for(&cwd);
     let config = loader.load().ok()?;
     config.aliases().get(alias).cloned()
+}
+
+/// Every `--disallowedTools` value in argv (repeatable; `=` form accepted).
+/// Unknown names are not an error — the deny list only removes.
+fn disallowed_tool_values(args: &[String]) -> Vec<String> {
+    let mut values = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        if matches!(arg, "--disallowedTools" | "--disallowed-tools") {
+            if let Some(value) = args.get(index + 1) {
+                values.push(value.clone());
+            }
+            index += 2;
+            continue;
+        }
+        if let Some(value) = arg
+            .strip_prefix("--disallowedTools=")
+            .or_else(|| arg.strip_prefix("--disallowed-tools="))
+        {
+            values.push(value.to_string());
+        }
+        index += 1;
+    }
+    values
 }
 
 fn normalize_allowed_tools(values: &[String]) -> Result<Option<AllowedToolSet>, String> {
@@ -11029,6 +11075,9 @@ impl CliToolExecutor {
 
 impl ToolExecutor for CliToolExecutor {
     fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError> {
+        if tools::disallowed_tools().contains(tool_name) {
+            return Err(ToolError::new(tools::disallowed_tool_error(tool_name)));
+        }
         if self
             .allowed_tools
             .as_ref()
@@ -11231,6 +11280,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         "  --dangerously-skip-permissions  Skip all permission checks"
     )?;
     writeln!(out, "  --allowedTools TOOLS       Restrict enabled tools (repeatable; comma-separated aliases supported)")?;
+    writeln!(out, "  --disallowedTools TOOLS    Hide and refuse tools (repeatable; comma-separated; unknown names ignored)")?;
     writeln!(
         out,
         "  --version, -V              Print version and build information locally"
@@ -12146,6 +12196,42 @@ mod tests {
                 allow_broad_cwd: false,
             }
         );
+    }
+
+    #[test]
+    fn disallowed_tools_flag_parses_and_tolerates_unknown_names() {
+        use super::disallowed_tool_values;
+        let _guard = env_lock();
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        let args = vec![
+            "--output-format".to_string(),
+            "json".to_string(),
+            "--disallowedTools".to_string(),
+            "MCP,McpAuth,teleport".to_string(),
+            "--disallowed-tools=REPL".to_string(),
+            "prompt".to_string(),
+            "hello".to_string(),
+        ];
+        // Unknown names never fail the run (unlike --allowedTools), and the
+        // flag does not leak into the prompt or the allowed set.
+        match parse_args(&args).expect("args should parse") {
+            CliAction::Prompt {
+                prompt,
+                allowed_tools,
+                ..
+            } => {
+                assert_eq!(prompt, "hello");
+                assert_eq!(allowed_tools, None);
+            }
+            other => panic!("expected a prompt action, got {other:?}"),
+        }
+        assert_eq!(
+            disallowed_tool_values(&args),
+            vec!["MCP,McpAuth,teleport".to_string(), "REPL".to_string()]
+        );
+        let error =
+            parse_args(&["--disallowedTools".to_string()]).expect_err("the flag needs a value");
+        assert!(error.contains("missing value for --disallowedTools"));
     }
 
     #[test]

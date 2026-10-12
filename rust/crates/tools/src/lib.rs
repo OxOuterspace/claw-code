@@ -256,6 +256,17 @@ impl GlobalToolRegistry {
 
     #[must_use]
     pub fn definitions(&self, allowed_tools: Option<&BTreeSet<String>>) -> Vec<ToolDefinition> {
+        self.definitions_excluding(allowed_tools, disallowed_tools())
+    }
+
+    /// `definitions`, minus every tool named in `disallowed` — a disallowed
+    /// tool is not advertised to the model at all.
+    #[must_use]
+    pub fn definitions_excluding(
+        &self,
+        allowed_tools: Option<&BTreeSet<String>>,
+        disallowed: &BTreeSet<String>,
+    ) -> Vec<ToolDefinition> {
         let builtin = mvp_tool_specs()
             .into_iter()
             .filter(|spec| allowed_tools.is_none_or(|allowed| allowed.contains(spec.name)))
@@ -285,7 +296,11 @@ impl GlobalToolRegistry {
                 description: tool.definition().description.clone(),
                 input_schema: tool.definition().input_schema.clone(),
             });
-        builtin.chain(runtime).chain(plugin).collect()
+        builtin
+            .chain(runtime)
+            .chain(plugin)
+            .filter(|definition| !disallowed.contains(&definition.name))
+            .collect()
     }
 
     pub fn permission_specs(
@@ -348,6 +363,7 @@ impl GlobalToolRegistry {
     }
 
     pub fn execute(&self, name: &str, input: &Value) -> Result<String, String> {
+        refuse_disallowed(name)?;
         if mvp_tool_specs().iter().any(|spec| spec.name == name) {
             return execute_tool_with_enforcer(self.enforcer.as_ref(), name, input);
         }
@@ -376,6 +392,68 @@ impl GlobalToolRegistry {
         });
         builtin.chain(runtime).chain(plugin).collect()
     }
+}
+
+/// Tools hidden from the model and refused for the life of this process
+/// (`--disallowedTools`). Set once by the CLI before any registry is built;
+/// unset means nothing is disallowed.
+static DISALLOWED_TOOLS: std::sync::OnceLock<BTreeSet<String>> = std::sync::OnceLock::new();
+
+/// Resolve `--disallowedTools` values (repeatable, comma/space separated) to
+/// tool names. A builtin name or alias resolves case-insensitively to its
+/// canonical name; any other token is kept verbatim, so a name this build does
+/// not know (or an MCP tool discovered later) never fails the run — unlike
+/// `--allowedTools`, an unknown deny entry is harmless.
+#[must_use]
+pub fn normalize_disallowed_tools(values: &[String]) -> BTreeSet<String> {
+    let mut name_map = mvp_tool_specs()
+        .iter()
+        .map(|spec| (normalize_tool_name(spec.name), spec.name.to_string()))
+        .collect::<BTreeMap<_, _>>();
+    for (alias, canonical) in [
+        ("read", "read_file"),
+        ("write", "write_file"),
+        ("edit", "edit_file"),
+        ("glob", "glob_search"),
+        ("grep", "grep_search"),
+    ] {
+        name_map.insert(alias.to_string(), canonical.to_string());
+    }
+    values
+        .iter()
+        .flat_map(|value| {
+            value
+                .split(|ch: char| ch == ',' || ch.is_whitespace())
+                .filter(|token| !token.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .map(|token| {
+            name_map
+                .get(&normalize_tool_name(&token))
+                .cloned()
+                .unwrap_or(token)
+        })
+        .collect()
+}
+
+/// Install the process-wide deny set. The first call wins; later calls are
+/// ignored (the CLI sets it once, before building any registry).
+pub fn set_disallowed_tools(names: BTreeSet<String>) {
+    let _ = DISALLOWED_TOOLS.set(names);
+}
+
+/// The process-wide deny set (empty when `--disallowedTools` was not given).
+#[must_use]
+pub fn disallowed_tools() -> &'static BTreeSet<String> {
+    static EMPTY: BTreeSet<String> = BTreeSet::new();
+    DISALLOWED_TOOLS.get().unwrap_or(&EMPTY)
+}
+
+/// The error a call to a disallowed tool returns, as a failed tool result.
+#[must_use]
+pub fn disallowed_tool_error(name: &str) -> String {
+    format!("tool `{name}` is disabled by the current --disallowedTools setting")
 }
 
 fn normalize_tool_name(value: &str) -> String {
@@ -1272,7 +1350,18 @@ pub fn enforce_permission_check(
 }
 
 pub fn execute_tool(name: &str, input: &Value) -> Result<String, String> {
+    refuse_disallowed(name)?;
     execute_tool_with_enforcer(None, name, input)
+}
+
+/// Refuses a builtin named in `--disallowedTools`. Checked by each caller of
+/// `execute_tool_with_enforcer` (outside its logging aspect, which rewraps
+/// errors) so a disallowed builtin never runs, whoever dispatches it.
+fn refuse_disallowed(name: &str) -> Result<(), String> {
+    if disallowed_tools().contains(name) {
+        return Err(disallowed_tool_error(name));
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -5198,6 +5287,7 @@ impl ToolExecutor for SubagentToolExecutor {
                 "tool `{tool_name}` is not enabled for this sub-agent"
             )));
         }
+        refuse_disallowed(tool_name).map_err(ToolError::new)?;
         let value = serde_json::from_str(input)
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
         execute_tool_with_enforcer(self.enforcer.as_ref(), tool_name, &value)
@@ -5209,6 +5299,7 @@ fn tool_specs_for_allowed_tools(allowed_tools: Option<&BTreeSet<String>>) -> Vec
     mvp_tool_specs()
         .into_iter()
         .filter(|spec| allowed_tools.is_none_or(|allowed| allowed.contains(spec.name)))
+        .filter(|spec| !disallowed_tools().contains(spec.name))
         .collect()
 }
 
@@ -5375,8 +5466,10 @@ fn execute_tool_search(input: ToolSearchInput) -> ToolSearchOutput {
 }
 
 fn deferred_tool_specs() -> Vec<ToolSpec> {
+    let disallowed = disallowed_tools();
     mvp_tool_specs()
         .into_iter()
+        .filter(|spec| !disallowed.contains(spec.name))
         .filter(|spec| {
             !matches!(
                 spec.name,
