@@ -805,7 +805,11 @@ fn build_assistant_message(
             "assistant {OUTPUT_TRUNCATED} (stop_reason: {reason}); the partial reply was discarded"
         )));
     }
-    if blocks.is_empty() {
+    // A message with no visible text and no tool call is empty, whatever
+    // else it carries: a thinking-only message (seen live: one 126-char
+    // thinking block, output_tokens 0, right after a tool result) would
+    // otherwise "complete" the turn with nothing to show the user.
+    if !has_deliverable_content(&blocks) {
         return Err(RuntimeError::new(EMPTY_ASSISTANT_STREAM));
     }
 
@@ -814,6 +818,16 @@ fn build_assistant_message(
         usage,
         prompt_cache_events,
     ))
+}
+
+/// True when `blocks` hold something a turn can end on or continue from:
+/// a text block with non-whitespace content, or a tool call.
+fn has_deliverable_content(blocks: &[ContentBlock]) -> bool {
+    blocks.iter().any(|block| match block {
+        ContentBlock::Text { text } => !text.trim().is_empty(),
+        ContentBlock::ToolUse { .. } => true,
+        _ => false,
+    })
 }
 
 fn flush_text_block(text: &mut String, blocks: &mut Vec<ContentBlock>) {
@@ -1134,6 +1148,93 @@ mod tests {
         let error = runtime
             .run_turn("question", None)
             .expect_err("a second empty stream surfaces the error");
+
+        assert_eq!(error.to_string(), super::EMPTY_ASSISTANT_STREAM);
+        assert_eq!(runtime.api_client.requests.len(), 2);
+    }
+
+    fn thinking_only_stream() -> Vec<AssistantEvent> {
+        vec![
+            AssistantEvent::Thinking {
+                thinking: "I have the data; now I should summarise it.".to_string(),
+                signature: Some("sig".to_string()),
+            },
+            AssistantEvent::Usage(TokenUsage {
+                input_tokens: 10,
+                output_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+            }),
+            AssistantEvent::MessageStop,
+        ]
+    }
+
+    #[test]
+    fn build_assistant_message_treats_thinking_or_whitespace_only_as_empty() {
+        for events in [
+            thinking_only_stream(),
+            vec![
+                AssistantEvent::TextDelta("  \n\t ".to_string()),
+                AssistantEvent::MessageStop,
+            ],
+        ] {
+            let error = build_assistant_message(events)
+                .expect_err("no visible text and no tool call is the empty case");
+            assert_eq!(error.to_string(), super::EMPTY_ASSISTANT_STREAM);
+        }
+    }
+
+    #[test]
+    fn thinking_only_stream_is_resent_once_and_the_answer_delivered() {
+        let client = EmptyThenReplyClient {
+            streams: vec![
+                thinking_only_stream(),
+                vec![
+                    AssistantEvent::TextDelta("the answer".to_string()),
+                    AssistantEvent::MessageStop,
+                ],
+            ],
+            requests: Vec::new(),
+        };
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            client,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        );
+
+        let summary = runtime
+            .run_turn("question", None)
+            .expect("the resend recovers the turn");
+
+        assert_eq!(summary.assistant_messages.len(), 1);
+        assert!(matches!(
+            &summary.assistant_messages[0].blocks[0],
+            ContentBlock::Text { text } if text == "the answer"
+        ));
+        let requests = &runtime.api_client.requests;
+        assert_eq!(requests.len(), 2, "exactly one resend");
+        assert_eq!(requests[0], requests[1], "the resend is the same request");
+    }
+
+    #[test]
+    fn thinking_only_stream_twice_fails_the_turn_as_empty() {
+        let client = EmptyThenReplyClient {
+            streams: vec![thinking_only_stream(), thinking_only_stream()],
+            requests: Vec::new(),
+        };
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            client,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        );
+
+        let error = runtime
+            .run_turn("question", None)
+            .expect_err("a second thinking-only stream surfaces the empty error");
 
         assert_eq!(error.to_string(), super::EMPTY_ASSISTANT_STREAM);
         assert_eq!(runtime.api_client.requests.len(), 2);
