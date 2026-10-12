@@ -22,6 +22,15 @@ const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_INPUT_
 /// re-issues the request once on exactly this error.
 const EMPTY_ASSISTANT_STREAM: &str = "assistant stream produced no content";
 
+/// Carried by the error a reply cut off at `max_tokens` produces. A truncated
+/// reply is never a successful answer and is never re-sent: the same request
+/// would hit the same limit.
+pub const OUTPUT_TRUNCATED: &str = "output truncated at max_tokens";
+
+fn is_truncation_stop_reason(reason: &str) -> bool {
+    matches!(reason, "max_tokens" | "length")
+}
+
 /// Fully assembled request payload sent to the upstream model client.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiRequest {
@@ -44,6 +53,9 @@ pub enum AssistantEvent {
     },
     Usage(TokenUsage),
     PromptCache(PromptCacheEvent),
+    /// The provider's normalised stop reason (`end_turn`, `tool_use`,
+    /// `max_tokens`, OpenAI-compat `length`, …), when it reported one.
+    StopReason(String),
     MessageStop,
 }
 
@@ -379,6 +391,10 @@ where
             // A provider stream can end with no content block at all (seen
             // with grok-4-fast right after a tool result); the same request
             // re-sent succeeds. Re-issue it once before failing the turn.
+            // Only exactly that error: a truncation (stop_reason max_tokens,
+            // even with no content) fails at once. The empty attempt's usage
+            // is not recorded — it never became a message — so the turn's
+            // usage under-counts by that attempt; acceptable.
             let mut built = self.stream_assistant_message(request.clone());
             if matches!(&built, Err(error) if error.to_string() == EMPTY_ASSISTANT_STREAM) {
                 built = self.stream_assistant_message(request);
@@ -743,6 +759,7 @@ fn build_assistant_message(
     let mut blocks = Vec::new();
     let mut prompt_cache_events = Vec::new();
     let mut finished = false;
+    let mut stop_reason: Option<String> = None;
     let mut usage = None;
 
     for event in events {
@@ -764,6 +781,7 @@ fn build_assistant_message(
             }
             AssistantEvent::Usage(value) => usage = Some(value),
             AssistantEvent::PromptCache(event) => prompt_cache_events.push(event),
+            AssistantEvent::StopReason(reason) => stop_reason = Some(reason),
             AssistantEvent::MessageStop => {
                 finished = true;
             }
@@ -776,6 +794,16 @@ fn build_assistant_message(
         return Err(RuntimeError::new(
             "assistant stream ended without a message stop event",
         ));
+    }
+    // Checked before emptiness: an empty stream that stopped on max_tokens is
+    // a truncation (all of the budget went to reasoning), not an empty reply.
+    if let Some(reason) = stop_reason
+        .as_deref()
+        .filter(|r| is_truncation_stop_reason(r))
+    {
+        return Err(RuntimeError::new(format!(
+            "assistant {OUTPUT_TRUNCATED} (stop_reason: {reason}); the partial reply was discarded"
+        )));
     }
     if blocks.is_empty() {
         return Err(RuntimeError::new(EMPTY_ASSISTANT_STREAM));
@@ -1109,6 +1137,90 @@ mod tests {
 
         assert_eq!(error.to_string(), super::EMPTY_ASSISTANT_STREAM);
         assert_eq!(runtime.api_client.requests.len(), 2);
+    }
+
+    #[test]
+    fn a_reply_stopped_at_max_tokens_is_a_truncation_error_and_never_resent() {
+        for (stream, reason) in [
+            (
+                vec![
+                    AssistantEvent::TextDelta("half an ans".to_string()),
+                    AssistantEvent::StopReason("max_tokens".to_string()),
+                    AssistantEvent::MessageStop,
+                ],
+                "max_tokens",
+            ),
+            // Empty AND truncated: reasoning ate the budget. Truncation, not
+            // emptiness — so not re-sent.
+            (
+                vec![
+                    AssistantEvent::StopReason("length".to_string()),
+                    AssistantEvent::MessageStop,
+                ],
+                "length",
+            ),
+        ] {
+            let client = EmptyThenReplyClient {
+                streams: vec![
+                    stream,
+                    vec![
+                        AssistantEvent::TextDelta("never reached".to_string()),
+                        AssistantEvent::MessageStop,
+                    ],
+                ],
+                requests: Vec::new(),
+            };
+            let mut runtime = ConversationRuntime::new(
+                Session::new(),
+                client,
+                StaticToolExecutor::new(),
+                PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+                vec!["system".to_string()],
+            );
+
+            let error = runtime
+                .run_turn("question", None)
+                .expect_err("a truncated reply is not an answer");
+
+            let text = error.to_string();
+            assert!(text.contains(super::OUTPUT_TRUNCATED), "{text}");
+            assert!(text.contains(reason), "{text}");
+            assert!(
+                !text.contains("half an ans"),
+                "the partial reply is not surfaced"
+            );
+            assert_eq!(runtime.api_client.requests.len(), 1, "never re-sent");
+            assert!(
+                !runtime
+                    .session
+                    .messages
+                    .iter()
+                    .any(|m| m.role == MessageRole::Assistant),
+                "no assistant message is recorded"
+            );
+        }
+    }
+
+    #[test]
+    fn a_normal_stop_reason_is_an_ordinary_answer() {
+        let client = EmptyThenReplyClient {
+            streams: vec![vec![
+                AssistantEvent::TextDelta("done".to_string()),
+                AssistantEvent::StopReason("end_turn".to_string()),
+                AssistantEvent::MessageStop,
+            ]],
+            requests: Vec::new(),
+        };
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            client,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        );
+        runtime
+            .run_turn("q", None)
+            .expect("end_turn is a finished answer");
     }
 
     #[test]

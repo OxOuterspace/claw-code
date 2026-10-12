@@ -10040,6 +10040,9 @@ impl AnthropicRuntimeClient {
                 }
                 ApiStreamEvent::MessageDelta(delta) => {
                     events.push(AssistantEvent::Usage(delta.usage.token_usage()));
+                    if let Some(reason) = delta.delta.stop_reason {
+                        events.push(AssistantEvent::StopReason(reason));
+                    }
                 }
                 ApiStreamEvent::MessageStop(_) => {
                     saw_stop = true;
@@ -10975,6 +10978,9 @@ fn response_to_events(
     }
 
     events.push(AssistantEvent::Usage(response.usage.token_usage()));
+    if let Some(reason) = response.stop_reason {
+        events.push(AssistantEvent::StopReason(reason));
+    }
     events.push(AssistantEvent::MessageStop);
     Ok(events)
 }
@@ -15926,6 +15932,40 @@ UU conflicted.rs",
         assert_eq!(
             pending_tool,
             Some(("tool-1".to_string(), "read_file".to_string(), String::new(),))
+        );
+    }
+
+    #[test]
+    fn response_to_events_carries_the_stop_reason_before_message_stop() {
+        let mut out = Vec::new();
+        let events = response_to_events(
+            MessageResponse {
+                id: "msg-1".to_string(),
+                kind: "message".to_string(),
+                model: "anthropic/claude-opus-4-6".to_string(),
+                role: "assistant".to_string(),
+                content: vec![OutputContentBlock::Text {
+                    text: "half".to_string(),
+                }],
+                stop_reason: Some("max_tokens".to_string()),
+                stop_sequence: None,
+                usage: Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
+                },
+                request_id: None,
+            },
+            &mut out,
+        )
+        .expect("response conversion should succeed");
+
+        let n = events.len();
+        assert_eq!(events[n - 1], AssistantEvent::MessageStop);
+        assert_eq!(
+            events[n - 2],
+            AssistantEvent::StopReason("max_tokens".to_string())
         );
     }
 
