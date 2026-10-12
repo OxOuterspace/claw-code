@@ -5289,7 +5289,7 @@ impl RuntimeMcpState {
                 "MCP tool `{qualified_tool_name}` returned no result payload"
             ))
         })?;
-        serde_json::to_string_pretty(&result).map_err(|error| ToolError::new(error.to_string()))
+        mcp_tool_result_output(&result)
     }
 
     fn list_resources_for_server(&mut self, server_name: &str) -> Result<String, ToolError> {
@@ -10988,6 +10988,19 @@ fn prompt_cache_record_to_runtime_event(
     })
 }
 
+/// The tool_result text for an MCP `CallToolResult`. A result the server
+/// flagged `isError: true` is a failed call: the same text, returned as an
+/// error so the tool_result carries `is_error=true` (and the
+/// PostToolUseFailure hook runs) instead of reading as a success.
+fn mcp_tool_result_output(result: &runtime::McpToolCallResult) -> Result<String, ToolError> {
+    let output =
+        serde_json::to_string_pretty(result).map_err(|error| ToolError::new(error.to_string()))?;
+    if result.is_error == Some(true) {
+        return Err(ToolError::new(output));
+    }
+    Ok(output)
+}
+
 struct CliToolExecutor {
     renderer: TerminalRenderer,
     emit_output: bool,
@@ -12196,6 +12209,32 @@ mod tests {
                 allow_broad_cwd: false,
             }
         );
+    }
+
+    #[test]
+    fn mcp_is_error_result_is_a_failed_tool_result_with_unchanged_text() {
+        use super::mcp_tool_result_output;
+        let failed: runtime::McpToolCallResult = serde_json::from_value(serde_json::json!({
+            "content": [{"type": "text", "text": "no such portfolio"}],
+            "isError": true
+        }))
+        .expect("call result parses");
+        let expected = serde_json::to_string_pretty(&failed).expect("serialises");
+        let error = mcp_tool_result_output(&failed).expect_err("isError must fail the call");
+        assert_eq!(error.to_string(), expected, "the output text is unchanged");
+
+        for flag in [serde_json::json!(false), serde_json::Value::Null] {
+            let mut value = serde_json::json!({"content": [{"type": "text", "text": "42"}]});
+            if !flag.is_null() {
+                value["isError"] = flag;
+            }
+            let ok: runtime::McpToolCallResult =
+                serde_json::from_value(value).expect("call result parses");
+            assert_eq!(
+                mcp_tool_result_output(&ok).expect("not an error"),
+                serde_json::to_string_pretty(&ok).expect("serialises")
+            );
+        }
     }
 
     #[test]
