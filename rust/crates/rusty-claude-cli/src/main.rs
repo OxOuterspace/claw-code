@@ -161,6 +161,13 @@ impl ModelProvenance {
 fn max_tokens_for_model(model: &str) -> u32 {
     api::max_tokens_for_model(model)
 }
+
+/// The `max_tokens` a turn's requests carry: `plugins.maxOutputTokens` from
+/// config when set, else the model's default. The request is what the
+/// context-window preflight reads, so the override governs that too.
+fn max_tokens_for_runtime(model: &str, plugins: &runtime::RuntimePluginConfig) -> u32 {
+    api::max_tokens_for_model_with_override(model, plugins.max_output_tokens())
+}
 // Build-time constants injected by build.rs (fall back to static values when
 // build.rs hasn't run, e.g. in doc-test or unusual toolchain environments).
 const DEFAULT_DATE: &str = match option_env!("BUILD_DATE") {
@@ -9615,6 +9622,7 @@ fn build_runtime_with_plugin_state(
     plugin_registry.initialize()?;
     let policy = permission_policy(permission_mode, &feature_config, &tool_registry)
         .map_err(std::io::Error::other)?;
+    let max_tokens = max_tokens_for_runtime(&model, feature_config.plugins());
     let mut runtime = ConversationRuntime::new_with_features(
         session,
         AnthropicRuntimeClient::new(
@@ -9625,7 +9633,8 @@ fn build_runtime_with_plugin_state(
             allowed_tools.clone(),
             tool_registry.clone(),
             progress_reporter,
-        )?,
+        )?
+        .with_max_tokens(max_tokens),
         CliToolExecutor::new(
             allowed_tools.clone(),
             emit_output,
@@ -9741,6 +9750,7 @@ struct AnthropicRuntimeClient {
     tool_registry: GlobalToolRegistry,
     progress_reporter: Option<InternalPromptProgressReporter>,
     reasoning_effort: Option<String>,
+    max_tokens: u32,
 }
 
 impl AnthropicRuntimeClient {
@@ -9795,10 +9805,12 @@ impl AnthropicRuntimeClient {
                 ApiProviderClient::from_model_with_anthropic_auth(&resolved_model, None)?
             }
         };
+        let max_tokens = max_tokens_for_model(&model);
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
             client,
             session_id: session_id.to_string(),
+            max_tokens,
             model,
             enable_tools,
             emit_output,
@@ -9811,6 +9823,11 @@ impl AnthropicRuntimeClient {
 
     fn set_reasoning_effort(&mut self, effort: Option<String>) {
         self.reasoning_effort = effort;
+    }
+
+    fn with_max_tokens(mut self, max_tokens: u32) -> Self {
+        self.max_tokens = max_tokens;
+        self
     }
 }
 
@@ -9832,7 +9849,7 @@ impl ApiClient for AnthropicRuntimeClient {
         let is_post_tool = request_ends_with_tool_result(&request);
         let message_request = MessageRequest {
             model: self.model.clone(),
-            max_tokens: max_tokens_for_model(&self.model),
+            max_tokens: self.max_tokens,
             messages: convert_messages(&request.messages),
             system: (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n")),
             tools: self
@@ -12235,6 +12252,52 @@ mod tests {
                 serde_json::to_string_pretty(&ok).expect("serialises")
             );
         }
+    }
+
+    #[test]
+    fn plugins_max_output_tokens_sets_request_max_tokens_and_the_preflight_reads_it() {
+        use super::max_tokens_for_runtime;
+        use api::{InputContentBlock, InputMessage, MessageRequest};
+        let config_home = temp_dir();
+        let workspace = temp_dir();
+        fs::create_dir_all(&config_home).expect("config home");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let model = "claude-opus-4-6"; // 32k default output, 200k window
+
+        let unset = ConfigLoader::new(&workspace, &config_home)
+            .load()
+            .expect("config loads");
+        assert_eq!(max_tokens_for_runtime(model, unset.plugins()), 32_000);
+
+        fs::write(
+            workspace.join(".claw.json"),
+            r#"{"plugins":{"maxOutputTokens":4096}}"#,
+        )
+        .expect("write .claw.json");
+        let set = ConfigLoader::new(&workspace, &config_home)
+            .load()
+            .expect("config loads");
+        let max_tokens = max_tokens_for_runtime(model, set.plugins());
+        assert_eq!(max_tokens, 4096);
+
+        // ~180k input tokens: fits beside a 4096 reservation, not beside 32k.
+        let request = |max_tokens| MessageRequest {
+            model: model.to_string(),
+            max_tokens,
+            messages: vec![InputMessage {
+                role: "user".to_string(),
+                content: vec![InputContentBlock::Text {
+                    text: "x ".repeat(360_000),
+                }],
+            }],
+            ..Default::default()
+        };
+        api::preflight_message_request(&request(max_tokens))
+            .expect("the overridden reservation fits");
+        assert!(api::preflight_message_request(&request(32_000)).is_err());
+
+        fs::remove_dir_all(&workspace).ok();
+        fs::remove_dir_all(&config_home).ok();
     }
 
     #[test]
