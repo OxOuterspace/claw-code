@@ -390,7 +390,12 @@ impl GlobalToolRegistry {
             name: tool.definition().name.clone(),
             description: tool.definition().description.clone().unwrap_or_default(),
         });
-        builtin.chain(runtime).chain(plugin).collect()
+        let disallowed = disallowed_tools();
+        builtin
+            .chain(runtime)
+            .chain(plugin)
+            .filter(|spec| !disallowed.contains(&spec.name))
+            .collect()
     }
 }
 

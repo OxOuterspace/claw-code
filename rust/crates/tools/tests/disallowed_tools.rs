@@ -3,10 +3,11 @@
 
 use std::collections::BTreeSet;
 
+use runtime::PermissionMode;
 use serde_json::json;
 use tools::{
     disallowed_tool_error, disallowed_tools, execute_tool, normalize_disallowed_tools,
-    set_disallowed_tools, GlobalToolRegistry,
+    set_disallowed_tools, GlobalToolRegistry, RuntimeToolDefinition,
 };
 
 fn names(registry: &GlobalToolRegistry) -> BTreeSet<String> {
@@ -38,6 +39,7 @@ fn disallowed_tools_are_hidden_and_refused() {
         "mcp,ListMcpResources ReadMcpResource".to_string(),
         "McpAuth".to_string(),
         "repl,read,NoSuchTool".to_string(),
+        "mcp__x__hidden".to_string(),
     ]);
     assert!(denied.contains("MCP"));
     assert!(denied.contains("REPL"));
@@ -85,4 +87,32 @@ fn disallowed_tools_are_hidden_and_refused() {
         "the select still works"
     );
     assert!(!matches.iter().any(|name| name == "MCP" || name == "REPL"));
+
+    // A runtime (MCP) tool named in the deny set is hidden from both the
+    // definitions and ToolSearch, like a builtin.
+    let runtime = |name: &str| RuntimeToolDefinition {
+        name: name.to_string(),
+        description: Some("a runtime tool".to_string()),
+        input_schema: json!({"type": "object"}),
+        required_permission: PermissionMode::ReadOnly,
+    };
+    let registry = GlobalToolRegistry::builtin()
+        .with_runtime_tools(vec![runtime("mcp__x__hidden"), runtime("mcp__x__shown")])
+        .expect("runtime tools register");
+    let listed = names(&registry);
+    assert!(listed.contains("mcp__x__shown"));
+    assert!(!listed.contains("mcp__x__hidden"));
+    let found = serde_json::to_value(registry.search(
+        "select:mcp__x__hidden,mcp__x__shown",
+        10,
+        None,
+        None,
+    ))
+    .expect("search output serialises");
+    let matches = found["matches"].as_array().expect("matches array");
+    assert!(matches.iter().any(|name| name == "mcp__x__shown"));
+    assert!(
+        !matches.iter().any(|name| name == "mcp__x__hidden"),
+        "ToolSearch must not surface it"
+    );
 }
